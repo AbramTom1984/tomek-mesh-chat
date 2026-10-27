@@ -15,6 +15,7 @@ public final class MeshSession {
         void outgoing(long id,String text,String status);
         void delivery(long id,String status);
         void failed(String reason);
+        default void signal(String sender,SignalInfo sample) {}
     }
     private final Link link;
     private final Ui ui;
@@ -83,8 +84,6 @@ public final class MeshSession {
                 if(ready) packet(p);
                 else { if(backlog.size()==100) backlog.removeFirst(); backlog.addLast(p); }
             }
-            // A reboot signal can occur during the initial handshake; only
-            // force reconnection if a completed session has actually rebooted.
             if(Proto.num(f,8)!=0 && ready) ui.failed("Radio restarted. Reconnecting…");
         } catch(IllegalArgumentException ignored) {
             // Ignore malformed records without displaying or logging payloads.
@@ -116,6 +115,11 @@ public final class MeshSession {
         if(text.isEmpty()) return;
         String label=names.get(sender);
         if(label==null) label=String.format(Locale.US,"!%08x",sender);
+        // Read receive metadata only. No ping, reply, or other on-air transmission.
+        if(sender!=myNode) {
+            SignalInfo sample=SignalInfo.read(b);
+            if(sample!=null) ui.signal(label,sample);
+        }
         String key=myNode+":"+channel+":"+sender+":"+id;
         if(id==0) key += ":"+Proto.num(p,7)+":"+text.hashCode();
         ui.received(key,label,text);
@@ -134,7 +138,6 @@ public final class MeshSession {
         lastSend=now; pending.put(id,text);
         ui.outgoing(id,text,"Sending to local radio…");
         link.send(bytes,id);
-        // No host-side retransmissions: the radio owns on-air scheduling.
         return null;
     }
     public void written(long id) {

@@ -29,6 +29,20 @@ import java.util.*;
 public final class MainActivity extends Activity {
     private final Handler h=new Handler(Looper.getMainLooper());
     private TextView status,counter;
+
+    private TextView signalView;
+    private boolean radioReady=false;
+    private long readySince=0,lastSignalObserved=0,signalAgeAtRead=-1;
+    private SignalInfo lastSignal;
+    private String signalSender="";
+    private android.media.ToneGenerator tone;
+    private final Runnable signalTick=new Runnable() {
+        @Override public void run() {
+            if(!visible) return;
+            redrawSignal(); h.postDelayed(this,15000);
+        }
+    };
+
     private EditText input;
     private Button send;
     private ScrollView scroll;
@@ -101,7 +115,7 @@ public final class MainActivity extends Activity {
         LinearLayout page=new LinearLayout(this); page.setOrientation(LinearLayout.VERTICAL);
         page.setPadding(dp(14),dp(12),dp(14),dp(8)); page.setBackgroundColor(Color.rgb(16,24,34));
         TextView title=text("Tomek Mesh Chat",25,Color.WHITE); title.setTypeface(null,Typeface.BOLD); page.addView(title);
-        TextView subtitle=text("Simple LoRa messaging",13,Color.rgb(153,177,194)); page.addView(subtitle);
+        TextView subtitle=text("Simple LoRa messaging · 0.2.0",13,Color.rgb(153,177,194)); page.addView(subtitle);
         status=text("Not connected",14,Color.rgb(255,200,130)); status.setPadding(0,dp(12),0,dp(8)); page.addView(status);
         LinearLayout actions=new LinearLayout(this);
         Button connect=button("Connect"); Button disconnect=button("Disconnect"); Button more=button("More");
@@ -113,6 +127,7 @@ public final class MainActivity extends Activity {
         more.setOnClickListener(v->showMore()); page.addView(actions);
         TextView warning=text("Primary-channel chat — not a private direct message",12,Color.rgb(153,177,194));
         warning.setPadding(0,dp(6),0,dp(8)); page.addView(warning);
+        addOptions(page);
         messages=new LinearLayout(this); messages.setOrientation(LinearLayout.VERTICAL);
         scroll=new ScrollView(this); scroll.setFillViewport(true); scroll.addView(messages);
         page.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
@@ -140,8 +155,96 @@ public final class MainActivity extends Activity {
         });
         page.addView(composer); setContentView(page);
     }
+
+    private void addOptions(LinearLayout page) {
+        Button options=button("Options ▾");
+        page.addView(options,new LinearLayout.LayoutParams(-1,dp(38)));
+        LinearLayout panel=new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setVisibility(View.GONE);
+        LinearLayout row1=new LinearLayout(this),row2=new LinearLayout(this);
+        addSwitch(row1,"Sound","sound",false);
+        addSwitch(row1,"Vibrate","vibrate",false);
+        addSwitch(row2,"Keep screen on","screen",false);
+        addSwitch(row2,"Show signal","signal",true);
+        panel.addView(row1);panel.addView(row2);page.addView(panel);
+        options.setOnClickListener(v->{
+            boolean expand=panel.getVisibility()!=View.VISIBLE;
+            panel.setVisibility(expand?View.VISIBLE:View.GONE);
+            options.setText(expand?"Options ▴":"Options ▾");
+        });
+        signalView=text("",12,Color.rgb(163,190,202));
+        signalView.setPadding(dp(10),dp(6),dp(10),dp(6));
+        signalView.setBackground(background(Color.rgb(28,40,52),8));
+        page.addView(signalView,new LinearLayout.LayoutParams(-1,-2));
+        redrawSignal();
+    }
+    private void addSwitch(LinearLayout row,String label,String key,boolean defaultValue) {
+        Switch control=new Switch(this);
+        control.setText(label);control.setTextSize(12);control.setTextColor(Color.WHITE);
+        control.setPadding(dp(3),0,dp(9),0);control.setChecked(prefs.getBoolean(key,defaultValue));
+        row.addView(control,new LinearLayout.LayoutParams(0,dp(48),1));
+        control.setOnCheckedChangeListener((v,on)->{
+            prefs.edit().putBoolean(key,on).apply();
+            applyScreenOption();redrawSignal();
+        });
+    }
+    private void applyScreenOption() {
+        if(visible && prefs.getBoolean("screen",false))
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+    private String ageLabel(long millis) {
+        long seconds=Math.max(0,millis/1000);
+        if(seconds<60) return seconds+" s ago";
+        if(seconds<3600) return (seconds/60)+" min ago";
+        return (seconds/3600)+" h ago";
+    }
+    private void redrawSignal() {
+        if(signalView==null) return;
+        signalView.setVisibility(prefs.getBoolean("signal",true)?View.VISIBLE:View.GONE);
+        if(lastSignal==null) {
+            signalView.setText("LoRa signal: waiting for a received message\nPassive only · no test transmissions");
+            signalView.setTextColor(Color.rgb(163,190,202));return;
+        }
+        long sinceRead=Math.max(0,SystemClock.elapsedRealtime()-lastSignalObserved);
+        long age=signalAgeAtRead<0?-1:signalAgeAtRead+sinceRead;
+        String snr=lastSignal.snr==null?"--":String.format(Locale.US,"%+.1f",lastSignal.snr);
+        String timing=age<0?"Packet time unavailable; observed "+ageLabel(sinceRead):"Received "+ageLabel(age);
+        String marker=!radioReady?" · disconnected":age<0?" · age unknown":age>=120000?" · old reading":"";
+        signalView.setText("Received from "+signalSender+"\nRSSI "+lastSignal.rssi+" dBm   |   SNR "+snr+" dB\n"+timing+marker+" · last radio hop");
+        signalView.setTextColor((!radioReady || age<0 || age>=120000)?Color.rgb(192,178,151):Color.rgb(177,213,205));
+    }
+    private void incomingFeedback() {
+        // Suppress initial configuration/backlog sounds and never wake the display.
+        if(!visible || !radioReady || SystemClock.elapsedRealtime()-readySince<3000) return;
+        if(prefs.getBoolean("sound",false)) {
+            try {
+                android.media.AudioManager audio=(android.media.AudioManager)getSystemService(AUDIO_SERVICE);
+                if(audio!=null && audio.getRingerMode()==android.media.AudioManager.RINGER_MODE_NORMAL) {
+                    releaseTone();
+                    tone=new android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION,55);
+                    tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP,100);
+                    android.media.ToneGenerator current=tone;
+                    h.postDelayed(()->{if(tone==current)releaseTone();},300);
+                }
+            } catch(Exception ignored) {}
+        }
+        if(prefs.getBoolean("vibrate",false)) {
+            try {
+                Vibrator vibrator=(Vibrator)getSystemService(VIBRATOR_SERVICE);
+                if(vibrator!=null && vibrator.hasVibrator())
+                    vibrator.vibrate(VibrationEffect.createOneShot(100,VibrationEffect.DEFAULT_AMPLITUDE));
+            } catch(Exception ignored) {}
+        }
+    }
+    private void releaseTone() {
+        if(tone!=null) {try {tone.release();} catch(Exception ignored) {}tone=null;}
+    }
+
     private void toast(String s) { Toast.makeText(this,s,Toast.LENGTH_LONG).show(); }
     private void showStatus(String s,boolean ready) {
+        if(ready && !radioReady) readySince=SystemClock.elapsedRealtime();
+        radioReady=ready; redrawSignal();
         status.setText(s); status.setTextColor(ready?Color.rgb(88,217,177):Color.rgb(255,200,130)); send.setEnabled(ready);
     }
     private void showMore() {
@@ -162,8 +265,8 @@ public final class MainActivity extends Activity {
                     if(details.length()==0) details.append("No USB devices detected. Check OTG, cable and power.");
                     new AlertDialog.Builder(this).setTitle("USB devices").setMessage(details.toString()).setPositiveButton("OK",null).show();
                 }
-                else new AlertDialog.Builder(this).setTitle("Prototype 0.1.0")
-                    .setMessage("Copyright (c) 2026 Tomasz Abramowicz\nMIT License\n\nIndependent Meshtastic-compatible client. No firmware changes.\n\nPrimary-channel broadcasts only, not private DMs. Radio write does not prove remote delivery. History is stored locally without app-level encryption. No Internet permission.\n\nKeep the app visible for this first version. No guaranteed background connection, screen-off reception or notifications. Close the official app's radio connection first. USB needs OTG/data support and power.\n\nThis build requires real-device testing.")
+                else new AlertDialog.Builder(this).setTitle("Prototype 0.2.0")
+                    .setMessage("Copyright (c) 2026 Tomasz Abramowicz\nMIT License\n\nIndependent Meshtastic-compatible client. No firmware changes.\n\nPrimary-channel broadcasts only, not private DMs. Radio write does not prove remote delivery. History is stored locally without app-level encryption. No Internet permission.\n\nKeep the app visible for this first version. No guaranteed background connection, screen-off reception or notifications. Close the official app's radio connection first. USB needs OTG/data support and power.\n\nPassive RSSI/SNR only, updated by received chat packets. No periodic LoRa tests. Sound/vibration are foreground-only. GPS sharing and traceroute are not included in this build. This update requires real-device testing.")
                     .setPositiveButton("OK",null).show();
             }).setNegativeButton("Close",null).show();
     }
@@ -189,6 +292,7 @@ public final class MainActivity extends Activity {
     @Override public void onRequestPermissionsResult(int code,String[] p,int[] results) {
         super.onRequestPermissionsResult(code,p,results);
         if(code==100) {
+            if(results.length==0) { auto=false; showStatus("Permission request cancelled.",false); return; }
             for(int r:results) if(r!=PackageManager.PERMISSION_GRANTED) { auto=false; showStatus("Bluetooth permission denied. USB is still available.",false); return; }
             auto=true; autoConnect(true);
         }
@@ -293,6 +397,7 @@ public final class MainActivity extends Activity {
     }
     private void openBle(BluetoothDevice device) {
         stopScan(); disconnect("Connecting over Bluetooth…");
+        lastSignal=null; redrawSignal();
         int token=++generation;
         link=new BleLink(this,device,events(token));
         session=new MeshSession(link,sessionUi(token));
@@ -300,6 +405,7 @@ public final class MainActivity extends Activity {
     }
     private void openUsb(UsbSerialDriver d) {
         stopScan(); disconnect("Connecting over USB…"); lastUsbId=d.getDevice().getDeviceName();
+        lastSignal=null; redrawSignal();
         int token=++generation;
         link=new UsbLink(usb,d,events(token));
         session=new MeshSession(link,sessionUi(token));
@@ -314,9 +420,17 @@ public final class MainActivity extends Activity {
     private MeshSession.Ui sessionUi(int token) { return new MeshSession.Ui() {
         public void state(String s,boolean ready) { if(token==generation) showStatus(s,ready); }
         public void failed(String s) { if(token==generation) disconnect(s); }
+        public void signal(String sender,SignalInfo sample) {
+            if(token!=generation) return;
+            signalSender=sender;lastSignal=sample;
+            lastSignalObserved=SystemClock.elapsedRealtime();
+            signalAgeAtRead=sample.ageMs(System.currentTimeMillis());
+            redrawSignal();
+        }
         public void received(String key,String sender,String value) {
             if(token!=generation || seen.contains(key)) return;
             seen.add(key); addMessage(key,sender,value,false,0,"Received");
+            incomingFeedback();
         }
         public void outgoing(long id,String value,String state) {
             if(token==generation) addMessage("out:"+System.currentTimeMillis()+":"+id,"You",value,true,id,state);
@@ -383,16 +497,18 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume(); visible=true; h.removeCallbacks(retry);
+        applyScreenOption();h.removeCallbacks(signalTick);h.post(signalTick);
         h.postDelayed(()->{ if(visible && auto) autoConnect(true); },400);
         h.postDelayed(retry,10000);
     }
     @Override protected void onStop() {
         visible=false; h.removeCallbacks(retry); stopScan();
+        h.removeCallbacks(signalTick);applyScreenOption();releaseTone();
         disconnect("Paused. Reconnects when the app is opened.");
         super.onStop();
     }
     @Override protected void onDestroy() {
-        h.removeCallbacksAndMessages(null);
+        releaseTone();h.removeCallbacksAndMessages(null);
         try { unregisterReceiver(usbReceiver); } catch(Exception ignored) {}
         disconnect("Closed"); super.onDestroy();
     }
