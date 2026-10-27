@@ -1,0 +1,11 @@
+// Mapsforge dependencies for Tomek Mesh Chat 0.3.0.
+// Apply from the app module: apply from: 'mapsforge-dependencies.gradle'
+// Keep all Mapsforge modules on the same version.
+def mapsforgeVersion = '0.21.0'
+dependencies {
+    implementation "org.mapsforge:mapsforge-core:${mapsforgeVersion}"
+    implementation "org.mapsforge:mapsforge-map:${mapsforgeVersion}"
+    implementation "org.mapsforge:mapsforge-map-reader:${mapsforgeVersion}"
+    implementation "org.mapsforge:mapsforge-map-android:${mapsforgeVersion}"
+    implementation "org.mapsforge:mapsforge-themes:${mapsforgeVersion}"
+}
