@@ -1,0 +1,124 @@
+name: Build APK - GPS 0.3.1 integration FIX
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Integrate MainActivity and map dependencies
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          root=Path.cwd()
+          p=root/'app/src/main/java/com/tomaszabramowicz/meshchat/MainActivity.java'
+          s=p.read_text(encoding='utf-8')
+          # All source edits are validated in memory before writing MainActivity.
+          def edit(old,new):
+           global s
+           if s.count(old)!=1:
+            raise SystemExit('Cannot safely integrate MainActivity: missing/ambiguous source anchor: '+old)
+           s=s.replace(old,new,1)
+          if not re.search(r'\bString\s+sendLocationPayload\s*\(',s):
+           edit('    private TextView status,counter;', '    private TextView status,counter;\n    String sendLocationPayload(String value) {\n        if(session==null) return "Connect to the radio first.";\n        return session.send(value);\n    }\n')
+          if not re.search(r'\bLocationFeature\s+locationFeature\s*;',s):
+           edit('    private TextView status,counter;', '    private TextView status,counter;\n    private LocationFeature locationFeature;')
+          if not re.search(r'locationFeature\s*=\s*new\s+LocationFeature\s*\(',s):
+           edit('buildUi(); loadHistory();','buildUi(); locationFeature=new LocationFeature(this); loadHistory();')
+          if not re.search(r'new\s+Intent\s*\(\s*this\s*,\s*OfflineMapActivity\.class\s*\)',s):
+           # A separate explicit marker avoids depending on the spelling of other map launchers.
+           if '// TMC_LOCATION_BUTTONS_FIX' not in s:
+            edit('        addOptions(page);','        // TMC_LOCATION_BUTTONS_FIX\n        LinearLayout gpsBar=new LinearLayout(this);\n        Button gpsButton=button("Location"),offlineButton=button("Offline map");\n        gpsBar.addView(gpsButton,new LinearLayout.LayoutParams(0,dp(44),1));\n        gpsBar.addView(offlineButton,new LinearLayout.LayoutParams(0,dp(44),1));\n        gpsButton.setOnClickListener(v->locationFeature.menu());\n        offlineButton.setOnClickListener(v->startActivity(new Intent(this,OfflineMapActivity.class)));\n        page.addView(gpsBar);\n        addOptions(page);')
+          if 'LocationFeature.PERMISSION' not in s:
+           edit('        if(code==100) {','        if(code==LocationFeature.PERMISSION){locationFeature.permissionResult();return;}\n        if(code==100) {')
+          if 'locationFeature.receive(' not in s:
+           edit('seen.add(key); addMessage(key,sender,value,false,0,"Received");','seen.add(key); String gpsText=locationFeature.receive(key,sender,value); addMessage(key,sender,gpsText==null?value:gpsText,false,0,"Received");')
+          if 'LocationCodec.describe(' not in s:
+           edit('if(token==generation) addMessage("out:"+System.currentTimeMillis()+":"+id,"You",value,true,id,state);','if(token==generation){LocationCodec.Record record=LocationCodec.parse(value);addMessage("out:"+System.currentTimeMillis()+":"+id,"You",record==null?value:LocationCodec.describe(record),true,id,state);}')
+          if 'locationFeature.cancel()' not in s:
+           edit('        visible=false; h.removeCallbacks(retry); stopScan();','        if(locationFeature!=null)locationFeature.cancel();\n        visible=false; h.removeCallbacks(retry); stopScan();')
+          s=s.replace('Simple LoRa messaging · 0.2.0','Simple LoRa messaging · 0.3.1').replace('Prototype 0.2.0','Prototype 0.3.1')
+          s=s.replace('The app does not read GPS coordinates.','GPS is read only when you explicitly request a location fix.')
+          s=s.replace('GPS sharing and traceroute are not included in this build.','One-shot phone GPS and offline map import. Shared-channel locations, NOT private DMs. No traceroute.')
+          for required in ['String sendLocationPayload(', 'locationFeature.receive(', 'LocationFeature.PERMISSION','locationFeature.cancel()']:
+           if required not in s:raise SystemExit('Integration check failed: '+required)
+          # Check all other required source files before committing edits.
+          for name in ['LocationFeature.java','LocationCodec.java','LocationStore.java','OfflineMapActivity.java']:
+           if not (p.parent/name).is_file():raise SystemExit('Missing source addition: '+name)
+          p.write_text(s,encoding='utf-8')
+          ns='{http://schemas.android.com/apk/res/android}'
+          ET.register_namespace('android',ns[1:-1]);p=root/'app/src/main/AndroidManifest.xml';tree=ET.parse(p);m=tree.getroot()
+          for name in ['android.permission.ACCESS_FINE_LOCATION','android.permission.ACCESS_COARSE_LOCATION']:
+           for e in list(m.findall('uses-permission')):
+            if e.get(ns+'name')==name:m.remove(e)
+           m.insert(0,ET.Element('uses-permission',{ns+'name':name}))
+          a=m.find('application')
+          if a is None:raise SystemExit('Missing manifest application')
+          if not any(x.get(ns+'name') in ['.OfflineMapActivity','com.tomaszabramowicz.meshchat.OfflineMapActivity'] for x in a.findall('activity')):
+           a.append(ET.Element('activity',{ns+'name':'.OfflineMapActivity',ns+'exported':'false',ns+'configChanges':'orientation|screenSize'}))
+          tree.write(p,encoding='utf-8',xml_declaration=True)
+          p=root/'app/build.gradle';s=p.read_text(encoding='utf-8')
+          s=re.sub(r'\bversionCode\s+\d+','versionCode 4',s)
+          s=re.sub(r"\bversionName\s+['\"][^'\"]+['\"]","versionName '0.3.1-integration-test'",s)
+          marker='// TMC_MAPSFORGE_EXPLICIT_FIX'
+          if marker not in s:
+           s+='\n'+marker+'\ndependencies {\n'
+           for module in ['core','map','map-reader','map-android','themes']:
+            s+="    implementation 'org.mapsforge:mapsforge-"+module+":0.21.0'\n"
+           s+='}\n'
+          p.write_text(s,encoding='utf-8')
+          print('Integrated MainActivity, GPS lifecycle, map Activity and explicit Mapsforge dependencies.')
+          PY
+      - name: Read project Gradle version
+        id: gv
+        run: |
+          V="$(sed -nE 's/.*gradle-([0-9]+(\.[0-9]+)+)-(bin|all)\.zip.*/\1/p' gradle/wrapper/gradle-wrapper.properties | head -n1)"
+          test -n "$V" || { echo 'Gradle wrapper version missing'; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gv.outputs.version }}
+      - name: Include license texts
+        run: |
+          mkdir -p app/src/main/assets/licenses
+          curl -fL --retry 3 https://www.gnu.org/licenses/lgpl-3.0.txt -o app/src/main/assets/licenses/LGPL-3.0.txt
+          curl -fL --retry 3 https://www.gnu.org/licenses/gpl-3.0.txt -o app/src/main/assets/licenses/GPL-3.0.txt
+          curl -fL --retry 3 https://www.apache.org/licenses/LICENSE-2.0.txt -o app/src/main/assets/licenses/Apache-2.0.txt
+      - name: Compile APK
+        run: gradle --no-daemon --console=plain :app:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tomek-Mesh-Chat-0.3.1-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Upload exact integrated sources
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tomek-Mesh-Chat-0.3.1-build-sources
+          path: |
+            app/src/
+            app/*.gradle
+            build.gradle
+            settings.gradle
+            gradle.properties
+            gradle/
+            tools/
+            tests/
+            THIRD_PARTY_LOCATION_03.md
+            LICENSE
