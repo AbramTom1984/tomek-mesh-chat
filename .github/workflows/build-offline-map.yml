@@ -1,0 +1,27 @@
+name: Build Offline Map - Edinburgh Dunfermline
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install map conversion tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmosis osmium-tool
+      - name: Create the regional Mapsforge map
+        run: bash tools/build_offline_map.sh
+      - name: Upload offline map and its source extract
+        uses: actions/upload-artifact@v4
+        with:
+          name: Edinburgh-Dunfermline-offline-map
+          path: map-output/
+          if-no-files-found: error
